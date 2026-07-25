@@ -1,0 +1,9 @@
+*.exe
+*.log
+*.zip
+bin/
+obj/
+release/
+*.user
+*.suo
+.vs/
