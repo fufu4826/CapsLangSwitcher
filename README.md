@@ -2,7 +2,11 @@
 
 Use `Caps Lock` as a Windows keyboard language switch key.
 
-CapsLangSwitcher is a tiny Windows tray app that remaps `Caps Lock` to switch to the next installed keyboard input language. It is useful for Thai/English typing and for anyone who wants a single dedicated language-switch key.
+## English
+
+CapsLangSwitcher is a lightweight Windows system-tray utility that changes `Caps Lock` into a keyboard language switch key. Press `Caps Lock` to switch between your installed input languages, such as English and Thai, without using `Windows + Space`.
+
+It runs quietly in the background, starts with Windows after installation, and does not require administrator permission or an internet connection.
 
 ## Features
 
@@ -14,7 +18,7 @@ CapsLangSwitcher is a tiny Windows tray app that remaps `Caps Lock` to switch to
 - No administrator permission required
 - No internet connection required
 
-## Download
+## Download and Install
 
 Go to the latest GitHub Release and download `CapsLangSwitcher.zip`.
 
@@ -26,17 +30,21 @@ After extracting:
 
 To remove it, double-click `Uninstall.cmd`.
 
-## Thai
+## ภาษาไทย
 
-โปรแกรมนี้ทำให้ปุ่ม `Caps Lock` กลายเป็นปุ่มเปลี่ยนภาษาใน Windows เหมาะสำหรับคนที่พิมพ์ไทย/อังกฤษบ่อย ๆ
+CapsLangSwitcher เป็นโปรแกรมขนาดเล็กสำหรับ Windows ที่ทำงานอยู่ใน system tray โดยเปลี่ยนปุ่ม `Caps Lock` ให้เป็นปุ่มเปลี่ยนภาษา เมื่อกด `Caps Lock` โปรแกรมจะสลับภาษาระหว่างภาษาที่ติดตั้งไว้ เช่น ภาษาไทยและภาษาอังกฤษ โดยไม่ต้องกด `Windows + Space`
 
-วิธีใช้:
+โปรแกรมทำงานอยู่เบื้องหลัง เปิดเองพร้อม Windows หลังติดตั้ง ไม่ต้องใช้สิทธิ์ Administrator และไม่ต้องเชื่อมต่ออินเทอร์เน็ต
+
+### วิธีติดตั้งและใช้งาน
 
 1. ดาวน์โหลด `CapsLangSwitcher.zip` จากหน้า Releases
-2. แตกไฟล์ zip
+2. แตกไฟล์ ZIP
 3. ดับเบิลคลิก `Install.cmd`
 4. กด `Caps Lock` เพื่อเปลี่ยนภาษา
-5. ถ้าต้องการถอนการติดตั้ง ให้ดับเบิลคลิก `Uninstall.cmd`
+5. คลิกขวาที่ไอคอนโปรแกรมมุมขวาล่างเพื่อเปิด/ปิดการทำงานหรือออกจากโปรแกรม
+
+หากต้องการถอนการติดตั้ง ให้ดับเบิลคลิก `Uninstall.cmd`
 
 หลังติดตั้ง โปรแกรมจะเปิดเองทุกครั้งที่เข้า Windows และจะมีไอคอนอยู่ใน system tray มุมขวาล่าง
 
