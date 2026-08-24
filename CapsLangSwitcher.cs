@@ -125,6 +125,7 @@ namespace CapsLangSwitcher {
         private readonly ToolStripMenuItem exitItem;
         private readonly System.Windows.Forms.Timer langTimer;
         private readonly Dictionary<string, Icon> iconCache = new Dictionary<string, Icon>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<IntPtr, IntPtr> requestedLayouts = new Dictionary<IntPtr, IntPtr>();
         private readonly string exePath;
         private readonly bool elevated;
 
@@ -410,9 +411,6 @@ namespace CapsLangSwitcher {
 
             uint threadId = GetWindowThreadProcessId(hwnd, IntPtr.Zero);
             IntPtr focusHwnd = GetFocusWindow(threadId);
-            if (focusHwnd != IntPtr.Zero) {
-                hwnd = focusHwnd;
-            }
 
             IntPtr[] layouts = GetAvailableLayouts();
             if (layouts.Length < 2) {
@@ -420,11 +418,23 @@ namespace CapsLangSwitcher {
             }
 
             IntPtr currentLayout = GetKeyboardLayout(threadId);
+            IntPtr requestedLayout;
+            if (requestedLayouts.TryGetValue(hwnd, out requestedLayout)) {
+                // Windows Terminal and elevated console hosts can accept a
+                // language request without updating GetKeyboardLayout(). Use
+                // the last layout requested for this window as the source for
+                // the next toggle so EN <-> TH continues to alternate.
+                currentLayout = requestedLayout;
+            }
             int currentIndex = IndexOfLayout(layouts, currentLayout);
             int nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % layouts.Length;
             nextLayout = layouts[nextIndex];
 
-            RequestLayoutChange(hwnd, nextLayout);
+            RequestLayoutChange(hwnd, focusHwnd, nextLayout);
+            if (requestedLayouts.Count > 128) {
+                requestedLayouts.Clear();
+            }
+            requestedLayouts[hwnd] = nextLayout;
 
             return true;
         }
@@ -532,8 +542,14 @@ namespace CapsLangSwitcher {
             return IntPtr.Zero;
         }
 
-        private static void RequestLayoutChange(IntPtr hwnd, IntPtr nextLayout) {
-            PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, nextLayout);
+        private static void RequestLayoutChange(IntPtr foregroundHwnd, IntPtr focusHwnd, IntPtr nextLayout) {
+            // Console hosts and Windows Terminal do not always handle the request
+            // on the same HWND. Sending the same target layout to both is
+            // idempotent and does not synthesize any keyboard input.
+            PostMessage(foregroundHwnd, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, nextLayout);
+            if (focusHwnd != IntPtr.Zero && focusHwnd != foregroundHwnd) {
+                PostMessage(focusHwnd, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, nextLayout);
+            }
         }
 
         private static int IndexOfLayout(IntPtr[] layouts, IntPtr currentLayout) {
@@ -746,6 +762,7 @@ namespace CapsLangSwitcher {
                 icon.Dispose();
             }
             iconCache.Clear();
+            requestedLayouts.Clear();
             osd.Dispose();
             ui.Dispose();
         }
