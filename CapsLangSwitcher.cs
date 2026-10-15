@@ -19,8 +19,8 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("CapsLangSwitcher")]
 [assembly: AssemblyProduct("CapsLangSwitcher")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
 
 namespace CapsLangSwitcher {
     internal enum OsdPosition {
@@ -123,9 +123,10 @@ namespace CapsLangSwitcher {
         private readonly ToolStripMenuItem settingsItem;
         private readonly ToolStripMenuItem restartItem;
         private readonly ToolStripMenuItem exitItem;
-        private readonly System.Windows.Forms.Timer langTimer;
+        private readonly System.Windows.Forms.Timer enforceTimer;
+        private readonly System.Windows.Forms.Timer hookWatchdogTimer;
         private readonly Dictionary<string, Icon> iconCache = new Dictionary<string, Icon>(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<IntPtr, IntPtr> requestedLayouts = new Dictionary<IntPtr, IntPtr>();
+        private readonly Dictionary<IntPtr, WindowLayoutState> windowStates = new Dictionary<IntPtr, WindowLayoutState>();
         private readonly string exePath;
         private readonly bool elevated;
 
@@ -133,17 +134,16 @@ namespace CapsLangSwitcher {
         private bool thaiUi = true;
         private OsdPosition osdPosition = OsdPosition.Default;
         private string lastLangCode = "";
+        private IntPtr pendingForegroundHwnd = IntPtr.Zero;
+        private IntPtr pendingFocusHwnd = IntPtr.Zero;
+        private IntPtr pendingLayout = IntPtr.Zero;
+        private uint pendingThreadId;
+        private uint pendingProcessId;
+        private int enforceAttempts;
+        private IntPtr[] cachedLayouts;
+        private IntPtr lastSwitchHwnd = IntPtr.Zero;
 
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct KBDLLHOOKSTRUCT {
-            public uint vkCode;
-            public uint scanCode;
-            public uint flags;
-            public uint time;
-            public IntPtr dwExtraInfo;
-        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct RECT {
@@ -166,6 +166,12 @@ namespace CapsLangSwitcher {
             public RECT rcCaret;
         }
 
+        private struct WindowLayoutState {
+            public uint ProcessId;
+            public IntPtr RequestedLayout;
+            public bool Unreliable;
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
 
@@ -182,6 +188,12 @@ namespace CapsLangSwitcher {
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processId);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindow(IntPtr hWnd);
+
         [DllImport("user32.dll")]
         private static extern IntPtr GetKeyboardLayout(uint idThread);
 
@@ -193,6 +205,9 @@ namespace CapsLangSwitcher {
 
         [DllImport("kernel32.dll")]
         private static extern uint GetCurrentThreadId();
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
 
         [DllImport("user32.dll")]
         private static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
@@ -212,20 +227,31 @@ namespace CapsLangSwitcher {
             ui = new UiPump();
             osd = new OsdForm();
 
-            langTimer = new System.Windows.Forms.Timer();
-            langTimer.Interval = 400;
-            langTimer.Tick += (s, e) => RefreshLanguageIcon(false);
+            enforceTimer = new System.Windows.Forms.Timer();
+            enforceTimer.Interval = 45;
+            enforceTimer.Tick += (s, e) => VerifyAndEnforceLayout();
+
+            // Windows can silently remove a low-level hook after sleep, unlock,
+            // or a hook timeout. A very low-frequency renewal keeps the tray app
+            // from looking alive while Caps Lock has reverted to normal.
+            hookWatchdogTimer = new System.Windows.Forms.Timer();
+            hookWatchdogTimer.Interval = 30000;
+            hookWatchdogTimer.Tick += (s, e) => RenewKeyboardHook(false);
 
             Application.ApplicationExit += OnApplicationExit;
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            SystemEvents.SessionSwitch += OnSessionSwitch;
 
             hookProc = HookCallback;
-            hookId = SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, IntPtr.Zero, 0);
 
             enabledItem = new ToolStripMenuItem("เปิดใช้: Caps Lock สลับภาษา");
             enabledItem.Checked = enabled;
             enabledItem.CheckOnClick = true;
             enabledItem.Click += (s, e) => {
                 enabled = enabledItem.Checked;
+                if (enabled) {
+                    RenewKeyboardHook(true);
+                }
                 UpdateText();
             };
 
@@ -274,6 +300,7 @@ namespace CapsLangSwitcher {
             exitItem.Click += (s, e) => ExitThread();
 
             var menu = new ContextMenuStrip();
+            menu.Opening += (s, e) => RefreshLanguageIcon(true);
             menu.Items.Add(enabledItem);
             menu.Items.Add(startupItem);
             menu.Items.Add(osdVisibleItem);
@@ -292,17 +319,17 @@ namespace CapsLangSwitcher {
             notifyIcon = new NotifyIcon();
             notifyIcon.ContextMenuStrip = menu;
             notifyIcon.Visible = true;
-            notifyIcon.DoubleClick += (s, e) => {
-                enabled = !enabled;
-                enabledItem.Checked = enabled;
-                UpdateText();
-            };
+
+            // Do not toggle Enabled on double-click. Accidental double-clicks on
+            // the tray icon used to leave the app running while restoring normal
+            // Caps Lock, which looked exactly like a broken keyboard hook.
 
             ApplyMenuLanguage();
             UpdatePositionMenu();
+            RenewKeyboardHook(true);
+            hookWatchdogTimer.Start();
 
             RefreshLanguageIcon(true);
-            langTimer.Start();
 
             if (elevated && IsRunKeyEnabled()) {
                 SetStartup(true);
@@ -347,14 +374,56 @@ namespace CapsLangSwitcher {
             }
         }
 
+        private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e) {
+            if (e.Mode == PowerModes.Resume) {
+                RenewKeyboardHook(false);
+            }
+        }
+
+        private void OnSessionSwitch(object sender, SessionSwitchEventArgs e) {
+            if (e.Reason == SessionSwitchReason.SessionUnlock ||
+                e.Reason == SessionSwitchReason.SessionLogon ||
+                e.Reason == SessionSwitchReason.ConsoleConnect ||
+                e.Reason == SessionSwitchReason.RemoteConnect) {
+                RenewKeyboardHook(false);
+            }
+        }
+
+        private void RenewKeyboardHook(bool notifyOnFailure) {
+            IntPtr oldHook = hookId;
+            hookId = IntPtr.Zero;
+            if (oldHook != IntPtr.Zero) {
+                UnhookWindowsHookEx(oldHook);
+            }
+
+            capsDown = false;
+            IntPtr module = GetModuleHandle(null);
+            hookId = SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, module, 0);
+            if (hookId == IntPtr.Zero) {
+                // Some Windows/.NET combinations accept a null module handle
+                // for WH_KEYBOARD_LL even when GetModuleHandle was rejected.
+                hookId = SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, IntPtr.Zero, 0);
+            }
+
+            if (hookId == IntPtr.Zero && notifyOnFailure && notifyIcon != null) {
+                notifyIcon.BalloonTipTitle = "CapsLangSwitcher";
+                notifyIcon.BalloonTipText = thaiUi
+                    ? "ไม่สามารถติดตั้งตัวดัก Caps Lock ได้ โปรแกรมจะลองใหม่อัตโนมัติ"
+                    : "Caps Lock hook failed. The app will retry automatically.";
+                notifyIcon.BalloonTipIcon = ToolTipIcon.Error;
+                notifyIcon.ShowBalloonTip(5000);
+            }
+        }
+
         private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam) {
             if (nCode >= 0) {
-                KBDLLHOOKSTRUCT data = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
-                if ((data.flags & LLKHF_INJECTED) != 0) {
+                uint vkCode = unchecked((uint)Marshal.ReadInt32(lParam));
+                uint flags = unchecked((uint)Marshal.ReadInt32(lParam, 8));
+                if ((flags & LLKHF_INJECTED) != 0) {
                     return CallNextHookEx(hookId, nCode, wParam, lParam);
                 }
 
-                if (data.vkCode == VK_CAPITAL) {
+                if (vkCode == VK_CAPITAL) {
                     if (!enabled) {
                         return CallNextHookEx(hookId, nCode, wParam, lParam);
                     }
@@ -409,17 +478,19 @@ namespace CapsLangSwitcher {
                 return false;
             }
 
-            uint threadId = GetWindowThreadProcessId(hwnd, IntPtr.Zero);
+            uint processId;
+            uint threadId = GetWindowThreadProcessId(hwnd, out processId);
             IntPtr focusHwnd = GetFocusWindow(threadId);
 
-            IntPtr[] layouts = GetAvailableLayouts();
+            IntPtr[] layouts = GetLayoutsForSwitch();
             if (layouts.Length < 2) {
                 return false;
             }
 
             IntPtr currentLayout = GetKeyboardLayout(threadId);
             IntPtr requestedLayout;
-            if (requestedLayouts.TryGetValue(hwnd, out requestedLayout)) {
+            bool unreliable;
+            if (TryGetWindowLayout(hwnd, out requestedLayout, out unreliable) && unreliable) {
                 // Windows Terminal and elevated console hosts can accept a
                 // language request without updating GetKeyboardLayout(). Use
                 // the last layout requested for this window as the source for
@@ -431,12 +502,66 @@ namespace CapsLangSwitcher {
             nextLayout = layouts[nextIndex];
 
             RequestLayoutChange(hwnd, focusHwnd, nextLayout);
-            if (requestedLayouts.Count > 128) {
-                requestedLayouts.Clear();
-            }
-            requestedLayouts[hwnd] = nextLayout;
+            SetWindowState(hwnd, processId, nextLayout, unreliable);
+            lastSwitchHwnd = hwnd;
+            BeginLayoutEnforcement(hwnd, focusHwnd, threadId, processId, nextLayout);
 
             return true;
+        }
+
+        private void BeginLayoutEnforcement(IntPtr foregroundHwnd, IntPtr focusHwnd, uint threadId, uint processId, IntPtr targetLayout) {
+            enforceTimer.Stop();
+            pendingForegroundHwnd = foregroundHwnd;
+            pendingFocusHwnd = focusHwnd;
+            pendingThreadId = threadId;
+            pendingProcessId = processId;
+            pendingLayout = targetLayout;
+            enforceAttempts = 0;
+            enforceTimer.Start();
+        }
+
+        private void VerifyAndEnforceLayout() {
+            if (pendingForegroundHwnd == IntPtr.Zero || pendingLayout == IntPtr.Zero) {
+                enforceTimer.Stop();
+                return;
+            }
+
+            WindowLayoutState state;
+            if (!windowStates.TryGetValue(pendingForegroundHwnd, out state) || state.ProcessId != pendingProcessId) {
+                // The window closed and its HWND got reused; the pending
+                // request no longer refers to the same window.
+                StopLayoutEnforcement();
+                return;
+            }
+
+            IntPtr observedLayout = GetKeyboardLayout(pendingThreadId);
+            if (SameLanguage(observedLayout, pendingLayout)) {
+                SetWindowState(pendingForegroundHwnd, pendingProcessId, observedLayout, false);
+                StopLayoutEnforcement();
+                return;
+            }
+
+            // A newly focused app may discard the first request while its input
+            // context is still activating. Re-send the exact same target layout;
+            // this is not a second toggle and does not synthesize key presses.
+            RequestLayoutChange(pendingForegroundHwnd, pendingFocusHwnd, pendingLayout);
+            enforceAttempts++;
+            if (enforceAttempts >= 3) {
+                // Some terminal hosts change language successfully but keep
+                // reporting their old HKL. Remember that behavior per window.
+                SetWindowState(pendingForegroundHwnd, pendingProcessId, pendingLayout, true);
+                StopLayoutEnforcement();
+            }
+        }
+
+        private void StopLayoutEnforcement() {
+            enforceTimer.Stop();
+            pendingForegroundHwnd = IntPtr.Zero;
+            pendingFocusHwnd = IntPtr.Zero;
+            pendingLayout = IntPtr.Zero;
+            pendingThreadId = 0;
+            pendingProcessId = 0;
+            enforceAttempts = 0;
         }
 
         private void Announce(IntPtr hwnd, IntPtr layout) {
@@ -449,9 +574,20 @@ namespace CapsLangSwitcher {
         }
 
         private void RefreshLanguageIcon(bool force) {
-            IntPtr hwnd = GetForegroundWindow();
+            // Opening the tray menu makes the taskbar the foreground window,
+            // so prefer the window where Caps Lock last switched languages.
+            IntPtr hwnd = lastSwitchHwnd;
+            if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) {
+                hwnd = GetForegroundWindow();
+            }
             uint threadId = hwnd == IntPtr.Zero ? GetCurrentThreadId() : GetWindowThreadProcessId(hwnd, IntPtr.Zero);
-            string code = GetLangCode(GetKeyboardLayout(threadId));
+            IntPtr layout = GetKeyboardLayout(threadId);
+            IntPtr requestedLayout;
+            bool unreliable;
+            if (hwnd != IntPtr.Zero && TryGetWindowLayout(hwnd, out requestedLayout, out unreliable) && unreliable) {
+                layout = requestedLayout;
+            }
+            string code = GetLangCode(layout);
             if (!force && String.Equals(code, lastLangCode, StringComparison.OrdinalIgnoreCase)) {
                 return;
             }
@@ -552,6 +688,36 @@ namespace CapsLangSwitcher {
             }
         }
 
+        private bool TryGetWindowLayout(IntPtr hwnd, out IntPtr requestedLayout, out bool unreliable) {
+            requestedLayout = IntPtr.Zero;
+            unreliable = false;
+            WindowLayoutState state;
+            if (!windowStates.TryGetValue(hwnd, out state)) {
+                return false;
+            }
+            uint processId;
+            GetWindowThreadProcessId(hwnd, out processId);
+            if (processId == 0 || processId != state.ProcessId) {
+                // HWND values get reused for new windows; drop stale state.
+                windowStates.Remove(hwnd);
+                return false;
+            }
+            requestedLayout = state.RequestedLayout;
+            unreliable = state.Unreliable;
+            return true;
+        }
+
+        private void SetWindowState(IntPtr hwnd, uint processId, IntPtr requestedLayout, bool unreliable) {
+            if (windowStates.Count > 128) {
+                windowStates.Clear();
+            }
+            WindowLayoutState state;
+            state.ProcessId = processId;
+            state.RequestedLayout = requestedLayout;
+            state.Unreliable = unreliable;
+            windowStates[hwnd] = state;
+        }
+
         private static int IndexOfLayout(IntPtr[] layouts, IntPtr currentLayout) {
             for (int i = 0; i < layouts.Length; i++) {
                 if (layouts[i] == currentLayout) {
@@ -568,21 +734,33 @@ namespace CapsLangSwitcher {
             return -1;
         }
 
-        private static IntPtr[] GetAvailableLayouts() {
+        private static bool SameLanguage(IntPtr first, IntPtr second) {
+            return (first.ToInt64() & 0xffff) == (second.ToInt64() & 0xffff);
+        }
+
+        private IntPtr[] GetLayoutsForSwitch() {
+            // Query the live list every time: the user can add or remove
+            // keyboard languages while the app is running.
             int count = GetKeyboardLayoutList(0, null);
             if (count >= 2) {
                 IntPtr[] loaded = new IntPtr[count];
                 if (GetKeyboardLayoutList(count, loaded) > 0) {
+                    cachedLayouts = null;
                     return loaded;
                 }
             }
 
-            string[] klids = GetPreloadedKeyboardLayouts();
-            IntPtr[] layouts = new IntPtr[klids.Length];
-            for (int i = 0; i < klids.Length; i++) {
-                layouts[i] = LoadKeyboardLayout(klids[i], KLF_SUBSTITUTE_OK);
+            // Rare: fewer than two layouts are loaded right now. Loading the
+            // registry preload is comparatively expensive, so cache it.
+            if (cachedLayouts == null || cachedLayouts.Length < 2) {
+                string[] klids = GetPreloadedKeyboardLayouts();
+                IntPtr[] layouts = new IntPtr[klids.Length];
+                for (int i = 0; i < klids.Length; i++) {
+                    layouts[i] = LoadKeyboardLayout(klids[i], KLF_SUBSTITUTE_OK);
+                }
+                cachedLayouts = layouts;
             }
-            return layouts;
+            return cachedLayouts;
         }
 
         private static string[] GetPreloadedKeyboardLayouts() {
@@ -749,12 +927,16 @@ namespace CapsLangSwitcher {
 
         private void OnApplicationExit(object sender, EventArgs e) {
             instance = null;
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            SystemEvents.SessionSwitch -= OnSessionSwitch;
             if (hookId != IntPtr.Zero) {
                 UnhookWindowsHookEx(hookId);
                 hookId = IntPtr.Zero;
             }
-            langTimer.Stop();
-            langTimer.Dispose();
+            enforceTimer.Stop();
+            hookWatchdogTimer.Stop();
+            enforceTimer.Dispose();
+            hookWatchdogTimer.Dispose();
             notifyIcon.Visible = false;
             notifyIcon.Icon = null;
             notifyIcon.Dispose();
@@ -762,7 +944,8 @@ namespace CapsLangSwitcher {
                 icon.Dispose();
             }
             iconCache.Clear();
-            requestedLayouts.Clear();
+            windowStates.Clear();
+            cachedLayouts = null;
             osd.Dispose();
             ui.Dispose();
         }
@@ -790,6 +973,8 @@ namespace CapsLangSwitcher {
 
         private string label = "";
         private readonly System.Windows.Forms.Timer hideTimer;
+        private readonly Font labelFont;
+        private readonly StringFormat labelFormat;
 
         public OsdForm() {
             FormBorderStyle = FormBorderStyle.None;
@@ -800,6 +985,10 @@ namespace CapsLangSwitcher {
             BackColor = Color.FromArgb(22, 22, 26);
             DoubleBuffered = true;
             Opacity = 0.92;
+            labelFont = new Font("Segoe UI", 28f, FontStyle.Bold, GraphicsUnit.Point);
+            labelFormat = new StringFormat();
+            labelFormat.Alignment = StringAlignment.Center;
+            labelFormat.LineAlignment = StringAlignment.Center;
             hideTimer = new System.Windows.Forms.Timer();
             hideTimer.Interval = 500;
             hideTimer.Tick += (s, e) => {
@@ -892,12 +1081,7 @@ namespace CapsLangSwitcher {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-            using (Font font = new Font("Segoe UI", 28f, FontStyle.Bold, GraphicsUnit.Point))
-            using (StringFormat sf = new StringFormat()) {
-                sf.Alignment = StringAlignment.Center;
-                sf.LineAlignment = StringAlignment.Center;
-                g.DrawString(label, font, Brushes.White, ClientRectangle, sf);
-            }
+            g.DrawString(label, labelFont, Brushes.White, ClientRectangle, labelFormat);
         }
 
         protected override bool ShowWithoutActivation {
@@ -919,6 +1103,8 @@ namespace CapsLangSwitcher {
             if (disposing) {
                 hideTimer.Stop();
                 hideTimer.Dispose();
+                labelFont.Dispose();
+                labelFormat.Dispose();
             }
             base.Dispose(disposing);
         }
