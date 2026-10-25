@@ -19,8 +19,8 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("CapsLangSwitcher")]
 [assembly: AssemblyProduct("CapsLangSwitcher")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.2.0")]
+[assembly: AssemblyFileVersion("1.0.2.0")]
 
 namespace CapsLangSwitcher {
     internal enum OsdPosition {
@@ -99,8 +99,12 @@ namespace CapsLangSwitcher {
         private const int WM_SYSKEYUP = 0x0105;
         private const int WM_INPUTLANGCHANGEREQUEST = 0x0050;
         private const int VK_CAPITAL = 0x14;
+        private const int VK_SPACE = 0x20;
+        private const int VK_LWIN = 0x5B;
         private const uint KLF_SUBSTITUTE_OK = 0x00000002;
         private const uint LLKHF_INJECTED = 0x10;
+        private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+        private const uint KEYEVENTF_KEYUP = 0x0002;
         private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValueName = "CapsLangSwitcher";
         private const string TaskName = "CapsLangSwitcher";
@@ -111,6 +115,8 @@ namespace CapsLangSwitcher {
         private static TrayApp instance;
         private static volatile bool enabled = true;
         private static volatile bool capsDown = false;
+        private static volatile bool capsChordUsed = false;
+        private static volatile bool suppressSpaceUntilUp = false;
 
         private readonly UiPump ui;
         private readonly OsdForm osd;
@@ -183,6 +189,9 @@ namespace CapsLangSwitcher {
         private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll")]
+        private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")]
@@ -193,6 +202,9 @@ namespace CapsLangSwitcher {
 
         [DllImport("user32.dll")]
         private static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetKeyboardLayout(uint idThread);
@@ -397,6 +409,8 @@ namespace CapsLangSwitcher {
             }
 
             capsDown = false;
+            capsChordUsed = false;
+            suppressSpaceUntilUp = false;
             IntPtr module = GetModuleHandle(null);
             hookId = SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, module, 0);
             if (hookId == IntPtr.Zero) {
@@ -423,21 +437,37 @@ namespace CapsLangSwitcher {
                     return CallNextHookEx(hookId, nCode, wParam, lParam);
                 }
 
-                if (vkCode == VK_CAPITAL) {
-                    if (!enabled) {
-                        return CallNextHookEx(hookId, nCode, wParam, lParam);
-                    }
-
-                    int msg = wParam.ToInt32();
+                int msg = wParam.ToInt32();
+                if (vkCode == VK_CAPITAL && enabled) {
                     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
                         if (!capsDown) {
                             capsDown = true;
-                            PostUi(SwitchLanguageImmediately);
+                            capsChordUsed = false;
                         }
                     } else if (msg == WM_KEYUP || msg == WM_SYSKEYUP) {
+                        bool switchLanguage = capsDown && !capsChordUsed;
                         capsDown = false;
+                        capsChordUsed = false;
+                        if (switchLanguage) {
+                            PostUi(SwitchLanguageImmediately);
+                        }
                     }
                     return (IntPtr)1;
+                }
+
+                if (vkCode == VK_SPACE && enabled) {
+                    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && capsDown) {
+                        if (!capsChordUsed) {
+                            capsChordUsed = true;
+                            suppressSpaceUntilUp = true;
+                            PostUi(ToggleRealCapsLock);
+                        }
+                        return (IntPtr)1;
+                    }
+                    if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && suppressSpaceUntilUp) {
+                        suppressSpaceUntilUp = false;
+                        return (IntPtr)1;
+                    }
                 }
             }
             return CallNextHookEx(hookId, nCode, wParam, lParam);
@@ -462,6 +492,13 @@ namespace CapsLangSwitcher {
             }
         }
 
+        private static void ToggleRealCapsLock() {
+            // Inject only Caps Lock itself. LLKHF_INJECTED makes our hook ignore
+            // these two events, so the OS receives a normal Caps Lock toggle.
+            keybd_event((byte)VK_CAPITAL, 0, 0, UIntPtr.Zero);
+            keybd_event((byte)VK_CAPITAL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+        }
+
         private void SwitchLanguageFromTap() {
             IntPtr hwnd;
             IntPtr nextLayout;
@@ -481,6 +518,7 @@ namespace CapsLangSwitcher {
             uint processId;
             uint threadId = GetWindowThreadProcessId(hwnd, out processId);
             IntPtr focusHwnd = GetFocusWindow(threadId);
+            bool gameSafe = IsGameSafeTarget(hwnd, processId);
 
             IntPtr[] layouts = GetLayoutsForSwitch();
             if (layouts.Length < 2) {
@@ -490,7 +528,7 @@ namespace CapsLangSwitcher {
             IntPtr currentLayout = GetKeyboardLayout(threadId);
             IntPtr requestedLayout;
             bool unreliable;
-            if (TryGetWindowLayout(hwnd, out requestedLayout, out unreliable) && unreliable) {
+            if (TryGetWindowLayout(hwnd, out requestedLayout, out unreliable) && (unreliable || gameSafe)) {
                 // Windows Terminal and elevated console hosts can accept a
                 // language request without updating GetKeyboardLayout(). Use
                 // the last layout requested for this window as the source for
@@ -501,10 +539,18 @@ namespace CapsLangSwitcher {
             int nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % layouts.Length;
             nextLayout = layouts[nextIndex];
 
-            RequestLayoutChange(hwnd, focusHwnd, nextLayout);
-            SetWindowState(hwnd, processId, nextLayout, unreliable);
+            if (gameSafe) {
+                SwitchLanguageWithSystemHotkey();
+            } else {
+                RequestLayoutChange(hwnd, focusHwnd, nextLayout);
+            }
+            SetWindowState(hwnd, processId, nextLayout, unreliable || gameSafe);
             lastSwitchHwnd = hwnd;
-            BeginLayoutEnforcement(hwnd, focusHwnd, threadId, processId, nextLayout);
+            if (gameSafe) {
+                StopLayoutEnforcement();
+            } else {
+                BeginLayoutEnforcement(hwnd, focusHwnd, threadId, processId, nextLayout);
+            }
 
             return true;
         }
@@ -567,9 +613,13 @@ namespace CapsLangSwitcher {
         private void Announce(IntPtr hwnd, IntPtr layout) {
             string code = GetLangCode(layout);
             SetTrayIcon(code);
-            if (showOsd) {
+            uint processId;
+            GetWindowThreadProcessId(hwnd, out processId);
+            if (showOsd && !IsGameSafeTarget(hwnd, processId)) {
                 Screen screen = hwnd == IntPtr.Zero ? Screen.PrimaryScreen : Screen.FromHandle(hwnd);
                 osd.ShowLang(GetOsdText(layout), screen, osdPosition);
+            } else {
+                osd.HideNow();
             }
         }
 
@@ -686,6 +736,49 @@ namespace CapsLangSwitcher {
             if (focusHwnd != IntPtr.Zero && focusHwnd != foregroundHwnd) {
                 PostMessage(focusHwnd, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, nextLayout);
             }
+        }
+
+        private static void SwitchLanguageWithSystemHotkey() {
+            // Never post WM_INPUTLANGCHANGEREQUEST into a full-screen game.
+            // FC Online (fczf.exe) loses its DirectInput/raw-input context when
+            // that message reaches the game window. Let Windows own the switch
+            // through its standard Win+Space shortcut instead.
+            keybd_event((byte)VK_LWIN, 0, KEYEVENTF_EXTENDEDKEY, UIntPtr.Zero);
+            keybd_event((byte)VK_SPACE, 0, 0, UIntPtr.Zero);
+            keybd_event((byte)VK_SPACE, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            keybd_event((byte)VK_LWIN, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, UIntPtr.Zero);
+        }
+
+        private static bool IsGameSafeTarget(IntPtr hwnd, uint processId) {
+            if (hwnd == IntPtr.Zero) {
+                return false;
+            }
+
+            try {
+                using (Process process = Process.GetProcessById((int)processId)) {
+                    string name = process.ProcessName ?? "";
+                    if (name.IndexOf("fconline", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("fifaonline", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("fifa4", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        String.Equals(name, "fczf", StringComparison.OrdinalIgnoreCase)) {
+                        return true;
+                    }
+                }
+            } catch (ArgumentException) {
+            } catch (InvalidOperationException) {
+            } catch (Win32Exception) {
+            }
+
+            RECT rect;
+            if (!GetWindowRect(hwnd, out rect)) {
+                return false;
+            }
+            Rectangle bounds = Screen.FromHandle(hwnd).Bounds;
+            const int tolerance = 2;
+            return Math.Abs(rect.left - bounds.Left) <= tolerance &&
+                Math.Abs(rect.top - bounds.Top) <= tolerance &&
+                Math.Abs(rect.right - bounds.Right) <= tolerance &&
+                Math.Abs(rect.bottom - bounds.Bottom) <= tolerance;
         }
 
         private bool TryGetWindowLayout(IntPtr hwnd, out IntPtr requestedLayout, out bool unreliable) {

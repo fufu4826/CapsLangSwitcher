@@ -8,9 +8,11 @@
 
 1. ดาวน์โหลดไฟล์จาก repo นี้
 2. ดับเบิลคลิก `CapsLangSwitcher.exe` แล้วกด Yes เมื่อ Windows ขอสิทธิ์ Administrator
-3. กด `Caps Lock` เพื่อสลับภาษาทันทีตั้งแต่กดปุ่มลง โดยไม่มีดีเลย์รอปล่อยปุ่ม
+3. กดแล้วปล่อย `Caps Lock` เพื่อสลับภาษา
 
-เมื่อสลับภาษา โปรแกรมจะแสดงภาษาใหม่บนหน้าจอชั่วครู่โดยไม่แย่ง focus และไม่ขวางการพิมพ์ ไอคอนใน system tray จะแสดง `EN`, `TH` หรือรหัสภาษาปัจจุบัน
+กด `Caps Lock` ค้างแล้วกด `Spacebar` เพื่อเปิด/ปิด Caps Lock จริง โดยคอมโบนี้จะไม่สลับภาษาและไม่พิมพ์ช่องว่าง
+
+เมื่อสลับภาษา โปรแกรมจะแสดงภาษาใหม่บนหน้าจอชั่วครู่โดยไม่แย่ง focus และไม่ขวางการพิมพ์ ไอคอนใน system tray จะแสดง `EN`, `TH` หรือรหัสภาษาปัจจุบัน ในเกมเต็มจอโปรแกรมจะปิด OSD และใช้ Game-safe mode อัตโนมัติเพื่อไม่รบกวนเมาส์หรือคีย์บอร์ดของเกม
 
 คลิกขวาที่ไอคอนเพื่อเปิดหรือปิดป้ายภาษาบนหน้าจอ และเลือกตำแหน่งค่าเริ่มต้น, มุมซ้ายบน, มุมขวาบน, มุมซ้ายล่าง, กึ่งกลางล่าง หรือมุมขวาล่างได้ เมนูใช้ภาษาไทยเป็นค่าเริ่มต้นและสลับเป็นภาษาอังกฤษได้ โปรแกรมจะจำค่าที่เลือกไว้
 
@@ -40,4 +42,4 @@
 
 CapsLangSwitcher is a lightweight Windows tray app that uses `Caps Lock` as a keyboard language switch key.
 
-Double-click `CapsLangSwitcher.exe` and accept the Administrator prompt. Press `Caps Lock` to switch languages immediately on key-down. The non-activating on-screen indicator appears briefly without stealing keyboard focus, and the current language is also shown in the tray icon. Running as Administrator is required so the switch works in games and elevated windows such as admin PowerShell. Right-click the tray icon to enable or disable the app, start it with Windows, open language settings, or exit.
+Double-click `CapsLangSwitcher.exe` and accept the Administrator prompt. Press and release `Caps Lock` to switch languages. Hold `Caps Lock` and press `Spacebar` to toggle real Caps Lock without switching language or typing a space. The non-activating on-screen indicator appears briefly without stealing keyboard focus; it is automatically suppressed for full-screen games, where a game-safe system language switch is used instead. Running as Administrator is required so the switch works in games and elevated windows such as admin PowerShell.
